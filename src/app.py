@@ -4,10 +4,15 @@ import plotly.express as px
 import plotly.graph_objects as go
 from pathlib import Path
 from groq import Groq
+import chromadb
+import torch
+from transformers import AutoTokenizer, AutoModel
 
 st.set_page_config(page_title="YES24 IT 모바일 베스트셀러 대시보드", layout="wide")
 
 DATA_PATH = Path(__file__).resolve().parent.parent / "data" / "yes24_it_mobile_bestsellers.csv"
+DB_PATH = Path(__file__).resolve().parent.parent / "data" / "chromadb"
+MODEL_NAME = "klue/bert-base"
 
 
 @st.cache_data
@@ -24,6 +29,47 @@ def load_data():
 
 
 df = load_data()
+
+
+@st.cache_resource
+def load_embedding_model():
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModel.from_pretrained(MODEL_NAME)
+    model.eval()
+    return tokenizer, model
+
+
+@st.cache_resource
+def load_vectordb():
+    client = chromadb.PersistentClient(path=str(DB_PATH))
+    return client.get_collection(name="yes24_books")
+
+
+def mean_pooling(model_output, attention_mask):
+    token_embeddings = model_output.last_hidden_state
+    input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+    return torch.sum(token_embeddings * input_mask_expanded, 1) / torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+
+
+def embed_query(text, tokenizer, model):
+    encoded = tokenizer(text, padding=True, truncation=True, max_length=512, return_tensors="pt")
+    with torch.no_grad():
+        output = model(**encoded)
+    emb = mean_pooling(output, encoded["attention_mask"])
+    emb = torch.nn.functional.normalize(emb, p=2, dim=1)
+    return emb.cpu().numpy().tolist()
+
+
+def search_books(query, top_n=20):
+    tokenizer, model = load_embedding_model()
+    collection = load_vectordb()
+    query_emb = embed_query(query, tokenizer, model)
+    results = collection.query(query_embeddings=query_emb, n_results=top_n)
+    docs = results["documents"][0]
+    metas = results["metadatas"][0]
+    distances = results["distances"][0]
+    return list(zip(docs, metas, distances))
+
 
 st.title("YES24 IT/모바일 베스트셀러 탐색적 데이터 분석")
 st.markdown("---")
@@ -257,88 +303,257 @@ with tab_chatbot:
         st.warning("좌측 사이드바에서 Groq API Key를 입력해주세요.")
         st.stop()
 
-    def build_book_context(query: str, top_n: int = 30) -> str:
-        query_lower = query.lower()
-        keywords = [w.strip() for w in query_lower.replace("·", " ").replace("×", " ").split() if len(w.strip()) >= 2]
+    # ── 함수 호출용 도구 정의 ──
+    TOOLS = [
+        {
+            "type": "function",
+            "function": {
+                "name": "get_books_by_price_range",
+                "description": "가격 범위로 도서를 검색하고 정렬합니다. 최소/최고 가격을 지정하여 해당 범위의 도서를 리뷰 수 순으로 반환합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "min_price": {"type": "integer", "description": "최소 가격 (원). 예: 15000"},
+                        "max_price": {"type": "integer", "description": "최고 가격 (원). 예: 25000"},
+                        "sort_by": {"type": "string", "enum": ["price_asc", "price_desc", "reviews", "rating", "rank"], "description": "정렬 기준. 기본값: reviews"},
+                        "top_n": {"type": "integer", "description": "반환할 도서 수. 기본값: 10"},
+                    },
+                    "required": ["min_price", "max_price"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_books_by_sales_index",
+                "description": "판매지수로 도서를 검색하고 정렬합니다. 판매지수는 리뷰 수(60%), 평점(25%), 순위(15%)를 종합하여 계산합니다. 키워드로 특정 도서를 필터링할 수도 있습니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keyword": {"type": "string", "description": "도서명/저자/출판사 키워드 필터. 없으면 전체 도서 대상."},
+                        "sort_order": {"type": "string", "enum": ["desc", "asc"], "description": "정렬 순서. 기본값: desc (높은순)"},
+                        "top_n": {"type": "integer", "description": "반환할 도서 수. 기본값: 10"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_price_statistics",
+                "description": "전체 또는 특정 조건의 도서 가격 통계를 반환합니다. 평균, 중앙값, 최솟값, 최댓값, 가격대별 분포를 제공합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keyword": {"type": "string", "description": "도서명/저자/출판사 키워드 필터. 없으면 전체 도서 대상."},
+                    },
+                    "required": [],
+                },
+            },
+        },
+    ]
 
-        score = pd.Series(0, index=df.index)
-        for kw in keywords:
-            score += df["Title"].str.contains(kw, case=False, na=False).astype(int) * 3
-            score += df["Author"].str.contains(kw, case=False, na=False).astype(int) * 2
-            score += df["Publisher"].str.contains(kw, case=False, na=False).astype(int) * 1
+    def exec_get_books_by_price_range(min_price, max_price, sort_by="reviews", top_n=10):
+        mask = (df["Price"] >= min_price) & (df["Price"] <= max_price)
+        result = df[mask].copy()
+        if result.empty:
+            return {"count": 0, "message": f"{min_price:,}원~{max_price:,}원 범위에 해당하는 도서가 없습니다.", "books": []}
+        sort_map = {
+            "price_asc": ("Price", True), "price_desc": ("Price", False),
+            "reviews": ("ReviewCount", False), "rating": ("Rating", False), "rank": ("Rank", True),
+        }
+        col, asc = sort_map.get(sort_by, ("ReviewCount", False))
+        result = result.sort_values(col, ascending=asc, na_position="last").head(top_n)
+        books = []
+        for _, r in result.iterrows():
+            books.append({
+                "rank": int(r["Rank"]), "title": r["Title"], "author": r["Author"],
+                "publisher": r["Publisher"], "price": int(r["Price"]),
+                "rating": round(r["Rating"], 1) if pd.notna(r["Rating"]) else None,
+                "reviews": int(r["ReviewCount"]) if pd.notna(r["ReviewCount"]) else 0,
+                "url": f"https://www.yes24.com/product/{int(r['GoodsNo'])}",
+            })
+        return {"count": len(books), "min_price": min_price, "max_price": max_price, "books": books}
 
-        if score.sum() == 0:
-            matched = df.head(top_n)
-        else:
-            matched = df[score > 0].head(top_n)
-            if len(matched) < 5:
-                matched = df.nlargest(top_n, "ReviewCount")
-
-        lines = []
-        for _, r in matched.iterrows():
-            rating = f"{r['Rating']:.1f}" if pd.notna(r["Rating"]) else "N/A"
-            reviews = int(r["ReviewCount"]) if pd.notna(r["ReviewCount"]) else 0
-            url = f"https://www.yes24.com/product/{int(r['GoodsNo'])}"
-            lines.append(
-                f"- [{int(r['Rank'])}위] {r['Title']} | 저자: {r['Author']} | 출판사: {r['Publisher']} | "
-                f"가격: {int(r['Price']):,}원 | 평점: {rating} | 리뷰: {reviews} | URL: {url}"
+    def exec_get_books_by_sales_index(keyword="", sort_order="desc", top_n=10):
+        work = df.copy()
+        if keyword:
+            kw = keyword.lower()
+            mask = (
+                work["Title"].str.contains(kw, case=False, na=False)
+                | work["Author"].str.contains(kw, case=False, na=False)
+                | work["Publisher"].str.contains(kw, case=False, na=False)
             )
-        return "\n".join(lines)
+            work = work[mask]
+        if work.empty:
+            return {"count": 0, "message": f"'{keyword}'에 해당하는 도서가 없습니다." if keyword else "데이터가 없습니다.", "books": []}
+        max_rev = work["ReviewCount"].max() if work["ReviewCount"].max() > 0 else 1
+        max_rank = work["Rank"].max() if work["Rank"].max() > 0 else 1
+        work = work.copy()
+        work["review_score"] = work["ReviewCount"].fillna(0) / max_rev
+        work["rating_score"] = work["Rating"].fillna(0) / 10
+        work["rank_score"] = 1 - (work["Rank"] / max_rank)
+        work["sales_index"] = (work["review_score"] * 0.60 + work["rating_score"] * 0.25 + work["rank_score"] * 0.15) * 100
+        work = work.sort_values("sales_index", ascending=(sort_order == "asc")).head(top_n)
+        books = []
+        for _, r in work.iterrows():
+            books.append({
+                "rank": int(r["Rank"]), "title": r["Title"], "author": r["Author"],
+                "publisher": r["Publisher"], "price": int(r["Price"]),
+                "rating": round(r["Rating"], 1) if pd.notna(r["Rating"]) else None,
+                "reviews": int(r["ReviewCount"]) if pd.notna(r["ReviewCount"]) else 0,
+                "sales_index": round(r["sales_index"], 1),
+                "url": f"https://www.yes24.com/product/{int(r['GoodsNo'])}",
+            })
+        return {"count": len(books), "keyword": keyword, "books": books}
+
+    def exec_get_price_statistics(keyword=""):
+        work = df.copy()
+        if keyword:
+            kw = keyword.lower()
+            mask = (
+                work["Title"].str.contains(kw, case=False, na=False)
+                | work["Author"].str.contains(kw, case=False, na=False)
+                | work["Publisher"].str.contains(kw, case=False, na=False)
+            )
+            work = work[mask]
+        if work.empty:
+            return {"message": f"'{keyword}'에 해당하는 도서가 없습니다." if keyword else "데이터가 없습니다."}
+        prices = work["Price"].dropna()
+        bins = [0, 15000, 20000, 25000, 30000, 40000, 100000]
+        labels = ["~1.5만", "1.5~2만", "2~2.5만", "2.5~3만", "3~4만", "4만+"]
+        dist = pd.cut(prices, bins=bins, labels=labels).value_counts().reindex(labels).fillna(0).astype(int).to_dict()
+        return {
+            "keyword": keyword,
+            "count": len(prices),
+            "mean": round(prices.mean()),
+            "median": round(prices.median()),
+            "min": int(prices.min()),
+            "max": int(prices.max()),
+            "std": round(prices.std()),
+            "distribution": {k: int(v) for k, v in dist.items()},
+        }
+
+    func_map = {
+        "get_books_by_price_range": lambda args: exec_get_books_by_price_range(**args),
+        "get_books_by_sales_index": lambda args: exec_get_books_by_sales_index(**args),
+        "get_price_statistics": lambda args: exec_get_price_statistics(**args),
+    }
 
     SYSTEM_PROMPT = """당신은 YES24 IT/모바일 베스트셀러 도서 추천 전문가입니다.
-아래 제공되는 도서 목록을 기반으로 사용자의 질문에 친절하게 답변하세요.
 
-규칙:
-1. 추천할 도서가 있으면 아래 형식으로 답변하세요:
-   - 도서명, 저자, 출판사, 가격, 평점, 리뷰 수를 포함하세요.
-   - 각 추천 도서 뒤에 반드시 YES24 링크를 [상세보기](URL) 형식으로 포함하세요.
-2. 추천할 도서가 없다면 "현재 데이터베이스에 요청하신 조건에 맞는 도서가 없습니다."라고 답변하세요.
-3. 사용자의 질문과 관련된 키워드(예: AI, 코딩, 파이썬, 바이브코딩, 프롬프트 등)를 파악하여 관련 도서를 추천하세요.
-4. 평점과 리뷰 수가 높은 도서를 우선 추천하세요.
-5. 답변은 한국어로 작성하세요.
-6. Markdown 형식을 사용하여 가독성 있게 작성하세요."""
+도구(function) 사용 규칙:
+- 사용자가 가격에 대해 질문하면 반드시 get_books_by_price_range 또는 get_price_statistics를 호출하세요.
+- 사용자가 판매지수/인기/순위에 대해 질문하면 반드시 get_books_by_sales_index를 호출하세요.
+- 가격과 판매지수를 모두 언급하면 두 함수를 모두 호출하세요.
+- 함수 결과를 바탕으로 답변하세요.
+
+답변 규칙:
+1. 추천 도서에는 반드시 [상세보기](URL) 링크를 포함하세요.
+2. 가격 범위 질문 시 해당 범위의 도서를 정렬하여 보여주세요.
+3. 판매지수 질문 시 판매지수 점수를 함께 표시하세요.
+4. 추천할 도서가 없으면 "해당 조건에 맞는 도서가 없습니다."라고 답변하세요.
+5. 한국어로 Markdown 형식으로 답변하세요."""
 
     if "chat_messages" not in st.session_state:
-        st.session_state.chat_messages = [
-            {"role": "system", "content": SYSTEM_PROMPT}
-        ]
+        st.session_state.chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
 
-    # ── 채팅 히스토리 표시 ──
     for msg in st.session_state.chat_messages:
         if msg["role"] == "system":
             continue
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # ── 사용자 입력 ──
-    if user_input := st.chat_input("원하는 도서 조건을 입력하세요 (예: AI 추천해줘, 파이썬 초보자용 책)"):
+    if user_input := st.chat_input("원하는 도서 조건을 입력하세요 (예: 2만원 이하 추천, 판매지수 높은 책)"):
         with st.chat_message("user"):
             st.markdown(user_input)
         st.session_state.chat_messages.append({"role": "user", "content": user_input})
 
-        book_ctx = build_book_context(user_input)
-        context_msg = (
-            f"아래는 YES24 IT/모바일 베스트셀러 데이터에서 추출한 도서 목록입니다.\n\n"
-            f"{book_ctx}\n\n"
-            f"위 데이터를 참고하여 사용자의 질문에 답변하세요."
-        )
-
-        messages_for_api = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": context_msg},
-            {"role": "user", "content": user_input},
-        ]
+        messages_for_api = list(st.session_state.chat_messages)
+        messages_for_api.append({"role": "user", "content": user_input})
 
         try:
-            client = Groq(api_key=groq_api_key)
-            with st.spinner("AI가 도서를 검색하고 있습니다..."):
-                response = client.chat.completions.create(
+            groq_client = Groq(api_key=groq_api_key)
+            with st.spinner("AI가 분석하고 있습니다..."):
+                response = groq_client.chat.completions.create(
                     model="llama-3.3-70b-versatile",
                     messages=messages_for_api,
+                    tools=TOOLS,
+                    tool_choice="auto",
                     temperature=0.3,
                     max_tokens=2048,
                 )
-                assistant_msg = response.choices[0].message.content
+                msg = response.choices[0]
+
+            if msg.tool_calls:
+                assistant_text = ""
+                tool_results_context = []
+                for tc in msg.tool_calls:
+                    fn_name = tc.function.name
+                    import json
+                    fn_args = json.loads(tc.function.arguments)
+                    result = func_map[fn_name](fn_args)
+                    tool_results_context.append({"tool": fn_name, "args": fn_args, "result": result})
+
+                tool_summary_lines = []
+                for tr in tool_results_context:
+                    fn = tr["tool"]
+                    res = tr["result"]
+                    if fn == "get_books_by_price_range":
+                        tool_summary_lines.append(f"[가격 범위 검색: {tr['args']['min_price']:,}원~{tr['args']['max_price']:,}원]")
+                        if res["books"]:
+                            for b in res["books"]:
+                                r_str = f"{b['rating']}" if b["rating"] else "N/A"
+                                tool_summary_lines.append(
+                                    f"  - {b['title']} | {b['author']} | {b['publisher']} | "
+                                    f"{b['price']:,}원 | 평점:{r_str} | 리뷰:{b['reviews']}건 | {b['url']}"
+                                )
+                        else:
+                            tool_summary_lines.append(f"  {res['message']}")
+                    elif fn == "get_books_by_sales_index":
+                        kw = tr["args"].get("keyword", "")
+                        tool_summary_lines.append(f"[판매지수 검색{f': {kw}' if kw else ''}]")
+                        if res["books"]:
+                            for b in res["books"]:
+                                r_str = f"{b['rating']}" if b["rating"] else "N/A"
+                                tool_summary_lines.append(
+                                    f"  - #{b['rank']} {b['title']} | 판매지수:{b['sales_index']} | "
+                                    f"{b['price']:,}원 | 평점:{r_str} | 리뷰:{b['reviews']}건 | {b['url']}"
+                                )
+                        else:
+                            tool_summary_lines.append(f"  {res['message']}")
+                    elif fn == "get_price_statistics":
+                        kw_label = tr["args"].get("keyword", "")
+                        tool_summary_lines.append(f"[가격 통계{': ' + kw_label if kw_label else ''}]")
+                        if "mean" in res:
+                            tool_summary_lines.append(
+                                f"  평균:{res['mean']:,}원 | 중앙값:{res['median']:,}원 | "
+                                f"최저:{res['min']:,}원 | 최고:{res['max']:,}원 | 도서 수:{res['count']}권"
+                            )
+                            dist_str = " | ".join(f"{k}:{v}권" for k, v in res["distribution"].items())
+                            tool_summary_lines.append(f"  가격대 분포: {dist_str}")
+                        else:
+                            tool_summary_lines.append(f"  {res['message']}")
+
+                tool_ctx = "\n".join(tool_summary_lines)
+                follow_messages = [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": user_input},
+                    {"role": "assistant", "content": f"[함수 호출 결과]\n{tool_ctx}"},
+                    {"role": "user", "content": "위 함수 호출 결과를 바탕으로 사용자에게 친절하게 답변해주세요. 도서 뒤에 반드시 YES24 링크를 포함하세요."},
+                ]
+                with st.spinner("AI가 답변을 생성하고 있습니다..."):
+                    follow_resp = groq_client.chat.completions.create(
+                        model="llama-3.3-70b-versatile",
+                        messages=follow_messages,
+                        temperature=0.3,
+                        max_tokens=2048,
+                    )
+                    assistant_msg = follow_resp.choices[0].message.content
+            else:
+                assistant_msg = msg.message.content
+
         except Exception as e:
             assistant_msg = f"API 호출 중 오류가 발생했습니다: {e}"
 
@@ -346,10 +561,7 @@ with tab_chatbot:
         with st.chat_message("assistant"):
             st.markdown(assistant_msg)
 
-    # ── 채팅 초기화 ──
     if st.session_state.chat_messages and len(st.session_state.chat_messages) > 1:
         if st.button("대화 초기화"):
-            st.session_state.chat_messages = [
-                {"role": "system", "content": SYSTEM_PROMPT}
-            ]
+            st.session_state.chat_messages = [{"role": "system", "content": SYSTEM_PROMPT}]
             st.rerun()
