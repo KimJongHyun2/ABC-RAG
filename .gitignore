@@ -17,8 +17,8 @@ node_modules/
 # OpenCode
 .agents/
 
-# ChromaDB
-data/chromadb/
+# ChromaDB - 배포를 위해 커밋에 포함 (data/chromadb/)
+# data/chromadb/
 
 # TSV (vector database related)
 *.tsv
