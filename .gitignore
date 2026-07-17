@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# Node.js
+node_modules/
+
+# OpenCode
+.agents/
+
+# ChromaDB
+data/chromadb/
+
+# TSV (vector database related)
+*.tsv
+
+# Excel files (Excel, PowerPoint 등 문서 파일 제외)
+*.xlsx
+*.xls
+*.xlsm
+*.xlsb
+*.pptx
+*.ppt
+*.potx
+*.pot
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
