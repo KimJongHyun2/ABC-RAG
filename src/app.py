@@ -352,6 +352,23 @@ with tab_chatbot:
                 },
             },
         },
+        {
+            "type": "function",
+            "function": {
+                "name": "get_books_by_keyword",
+                "description": "키워드로 도서를 검색합니다. 제목, 저자, 출판사에서 키워드를 포함하는 도서를 찾아 반환합니다.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "keyword": {"type": "string", "description": "검색 키워드. 제목, 저자, 출판사에서 검색됩니다."},
+                        "search_target": {"type": "string", "enum": ["title", "author", "publisher", "all"], "description": "검색 대상. 기본값: all (전체)"},
+                        "sort_by": {"type": "string", "enum": ["rank", "reviews", "rating", "price"], "description": "정렬 기준. 기본값: rank"},
+                        "top_n": {"type": "integer", "description": "반환할 도서 수. 기본값: 10"},
+                    },
+                    "required": ["keyword"],
+                },
+            },
+        },
     ]
 
     def exec_get_books_by_price_range(min_price, max_price, sort_by="reviews", top_n=10):
@@ -435,18 +452,56 @@ with tab_chatbot:
             "distribution": {k: int(v) for k, v in dist.items()},
         }
 
+    def exec_get_books_by_keyword(keyword, search_target="all", sort_by="rank", top_n=10):
+        kw = keyword.lower()
+        if search_target == "title":
+            mask = df["Title"].str.contains(kw, case=False, na=False)
+        elif search_target == "author":
+            mask = df["Author"].str.contains(kw, case=False, na=False)
+        elif search_target == "publisher":
+            mask = df["Publisher"].str.contains(kw, case=False, na=False)
+        else:
+            mask = (
+                df["Title"].str.contains(kw, case=False, na=False)
+                | df["Author"].str.contains(kw, case=False, na=False)
+                | df["Publisher"].str.contains(kw, case=False, na=False)
+            )
+        result = df[mask].copy()
+        if result.empty:
+            return {"count": 0, "message": f"'{keyword}'에 해당하는 도서가 없습니다.", "books": []}
+        sort_map = {
+            "rank": ("Rank", True),
+            "reviews": ("ReviewCount", False),
+            "rating": ("Rating", False),
+            "price": ("Price", True),
+        }
+        col, asc = sort_map.get(sort_by, ("Rank", True))
+        result = result.sort_values(col, ascending=asc, na_position="last").head(top_n)
+        books = []
+        for _, r in result.iterrows():
+            books.append({
+                "rank": int(r["Rank"]), "title": r["Title"], "author": r["Author"],
+                "publisher": r["Publisher"], "price": int(r["Price"]),
+                "rating": round(r["Rating"], 1) if pd.notna(r["Rating"]) else None,
+                "reviews": int(r["ReviewCount"]) if pd.notna(r["ReviewCount"]) else 0,
+                "url": f"https://www.yes24.com/product/{int(r['GoodsNo'])}",
+            })
+        return {"count": len(books), "keyword": keyword, "search_target": search_target, "books": books}
+
     func_map = {
         "get_books_by_price_range": lambda args: exec_get_books_by_price_range(**args),
         "get_books_by_sales_index": lambda args: exec_get_books_by_sales_index(**args),
         "get_price_statistics": lambda args: exec_get_price_statistics(**args),
+        "get_books_by_keyword": lambda args: exec_get_books_by_keyword(**args),
     }
 
     SYSTEM_PROMPT = """당신은 YES24 IT/모바일 베스트셀러 도서 추천 전문가입니다.
 
 도구(function) 사용 규칙:
+- 사용자가 키워드(제목, 저자, 출판사)로 도서를 검색하면 반드시 get_books_by_keyword를 호출하세요.
 - 사용자가 가격에 대해 질문하면 반드시 get_books_by_price_range 또는 get_price_statistics를 호출하세요.
 - 사용자가 판매지수/인기/순위에 대해 질문하면 반드시 get_books_by_sales_index를 호출하세요.
-- 가격과 판매지수를 모두 언급하면 두 함수를 모두 호출하세요.
+- 여러 조건이 복합적으로 주어지면 해당되는 모든 함수를 호출하세요.
 - 함수 결과를 바탕으로 답변하세요.
 
 답변 규칙:
@@ -533,6 +588,21 @@ with tab_chatbot:
                             )
                             dist_str = " | ".join(f"{k}:{v}권" for k, v in res["distribution"].items())
                             tool_summary_lines.append(f"  가격대 분포: {dist_str}")
+                        else:
+                            tool_summary_lines.append(f"  {res['message']}")
+                    elif fn == "get_books_by_keyword":
+                        keyword = tr["args"].get("keyword", "")
+                        search_target = tr["args"].get("search_target", "all")
+                        target_map = {"title": "제목", "author": "저자", "publisher": "출판사", "all": "전체"}
+                        target_str = target_map.get(search_target, "전체")
+                        tool_summary_lines.append(f"[키워드 검색: '{keyword}' ({target_str})]")
+                        if res["books"]:
+                            for b in res["books"]:
+                                r_str = f"{b['rating']}" if b["rating"] else "N/A"
+                                tool_summary_lines.append(
+                                    f"  - #{b['rank']} {b['title']} | {b['author']} | {b['publisher']} | "
+                                    f"{b['price']:,}원 | 평점:{r_str} | 리뷰:{b['reviews']}건 | {b['url']}"
+                                )
                         else:
                             tool_summary_lines.append(f"  {res['message']}")
 
