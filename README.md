@@ -9,6 +9,8 @@ YES24 IT/모바일 종합 베스트셀러 데이터를 수집하고 분석하는
 - **탐색적 데이터 분석(EDA)**: 가격, 평점, 리뷰 수 등 다양한 차트와 통계
 - **키워드 검색**: 제목, 저자, 출판사별 도서 검색
 - **도서 추천 챗봇**: Groq API와 Function Calling을 활용한 AI 도서 추천
+- **의미 기반 검색**: KLUE BERT 임베딩을 활용한 자연어 의미 검색
+- **임베딩 파일 업로드**: 배포 환경에서 ChromaDB ZIP 파일을 업로드하여 챗봇 사용 가능
 - **엑셀 대시보드**: openpyxl을 사용한 인터랙티브 대시보드 생성
 
 ## 프로젝트 구조
@@ -86,6 +88,17 @@ python src/create_excel_dashboard.py
 ## API Key 설정
 
 도서 추천 챗봇 기능을 사용하려면 [Groq Console](https://console.groq.com)에서 API Key를 발급받아 앱 실행 시 사이드바에 입력해야 합니다.
+
+## 임베딩 파일 업로드 (배포 환경)
+
+`data/chromadb/`는 `.gitignore`에 의해 커밋되지 않으므로, Streamlit Cloud 등 배포 환경에서는 기본 벡터 DB를 사용할 수 없습니다. 배포 후 챗봇의 의미 기반 검색을 사용하려면:
+
+1. 로컬에서 `python src/build_vectordb.py` 실행하여 `data/chromadb/` 생성
+2. `data/chromadb/` 폴더를 ZIP으로 압축
+3. 앱의 **도서 추천 챗봇** 탭에서 ZIP 파일 업로드
+4. 업로드된 벡터 DB로 의미 검색(`semantic_search_books`) 사용 가능
+
+> 미업로드 시 키워드 검색, 가격 검색 등 CSV 기반 기능은 정상 동작합니다.
 
 ## 라이선스
 

@@ -40,8 +40,9 @@ def load_embedding_model():
 
 
 @st.cache_resource
-def load_vectordb():
-    client = chromadb.PersistentClient(path=str(DB_PATH))
+def load_vectordb(db_path=None):
+    path = str(db_path) if db_path else str(DB_PATH)
+    client = chromadb.PersistentClient(path=path)
     return client.get_collection(name="yes24_books")
 
 
@@ -60,9 +61,9 @@ def embed_query(text, tokenizer, model):
     return emb.cpu().numpy().tolist()
 
 
-def search_books(query, top_n=20):
+def search_books(query, top_n=20, db_path=None):
     tokenizer, model = load_embedding_model()
-    collection = load_vectordb()
+    collection = load_vectordb(db_path)
     query_emb = embed_query(query, tokenizer, model)
     results = collection.query(query_embeddings=query_emb, n_results=top_n)
     docs = results["documents"][0]
@@ -299,6 +300,36 @@ with tab_search:
 with tab_chatbot:
     st.subheader("도서 추천 챗봇")
 
+    # ── 임베딩 파일 업로드 ──
+    st.markdown("#### 📁 임베딩 파일 업로드")
+    st.caption("배포 환경에서 챗봇을 사용하려면 ChromaDB ZIP 파일을 업로드하세요. (선택사항: 미업로드 시 기본 데이터 사용)")
+    uploaded_db = st.file_uploader(
+        "ChromaDB ZIP 파일 선택",
+        type=["zip"],
+        help="build_vectordb.py로 생성된 data/chromadb/ 폴더를 ZIP으로 압축하여 업로드하세요.",
+    )
+
+    if uploaded_db is not None:
+        import zipfile
+        import tempfile
+        import shutil
+
+        if "uploaded_db_path" not in st.session_state:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                zip_path = Path(tmpdir) / "chromadb.zip"
+                with open(zip_path, "wb") as f:
+                    f.write(uploaded_db.getbuffer())
+                extract_dir = Path(tempfile.gettempdir()) / "abc_rag_uploaded_db"
+                if extract_dir.exists():
+                    shutil.rmtree(extract_dir)
+                extract_dir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    zf.extractall(extract_dir)
+                st.session_state.uploaded_db_path = str(extract_dir)
+            st.success("✅ 임베딩 파일이 업로드되었습니다!")
+
+    db_path = st.session_state.get("uploaded_db_path", None)
+
     if not groq_api_key:
         st.warning("좌측 사이드바에서 Groq API Key를 입력해주세요.")
         st.stop()
@@ -366,6 +397,21 @@ with tab_chatbot:
                         "top_n": {"type": "integer", "description": "반환할 도서 수. 기본값: 10"},
                     },
                     "required": ["keyword"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "semantic_search_books",
+                "description": "의미 기반(임베딩) 검색으로 도서를 추천합니다. 사용자의 자연어 질문 의도와 가장 유사한 도서를 찾습니다. (예: '초보자를 위한 파이썬 입문서', '머신러닝 실무 도서')",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "의미 검색 쿼리. 도서 내용/주제/난이도 등을 자연어로 표현하세요."},
+                        "top_n": {"type": "integer", "description": "반환할 도서 수. 기본값: 5"},
+                    },
+                    "required": ["query"],
                 },
             },
         },
@@ -488,17 +534,41 @@ with tab_chatbot:
             })
         return {"count": len(books), "keyword": keyword, "search_target": search_target, "books": books}
 
+    def exec_semantic_search_books(query, top_n=5, db_path=None):
+        try:
+            results = search_books(query, top_n=top_n, db_path=db_path)
+            books = []
+            for doc, meta, dist in results:
+                books.append({
+                    "rank": int(meta.get("rank", 0)),
+                    "title": meta.get("title", ""),
+                    "author": meta.get("author", ""),
+                    "publisher": meta.get("publisher", ""),
+                    "price": int(meta.get("price", 0)),
+                    "rating": round(meta.get("rating", 0), 1) if meta.get("rating") else None,
+                    "reviews": int(meta.get("reviews", 0)),
+                    "url": meta.get("url", ""),
+                    "similarity": round(1 - dist, 3),
+                })
+            if not books:
+                return {"count": 0, "message": f"'{query}'와(과) 유사한 도서를 찾지 못했습니다.", "books": []}
+            return {"count": len(books), "query": query, "books": books}
+        except Exception as e:
+            return {"count": 0, "message": f"의미 검색 중 오류가 발생했습니다: {e}", "books": []}
+
     func_map = {
         "get_books_by_price_range": lambda args: exec_get_books_by_price_range(**args),
         "get_books_by_sales_index": lambda args: exec_get_books_by_sales_index(**args),
         "get_price_statistics": lambda args: exec_get_price_statistics(**args),
         "get_books_by_keyword": lambda args: exec_get_books_by_keyword(**args),
+        "semantic_search_books": lambda args: exec_semantic_search_books(db_path=db_path, **args),
     }
 
     SYSTEM_PROMPT = """당신은 YES24 IT/모바일 베스트셀러 도서 추천 전문가입니다.
 
 도구(function) 사용 규칙:
 - 사용자가 키워드(제목, 저자, 출판사)로 도서를 검색하면 반드시 get_books_by_keyword를 호출하세요.
+- 사용자가 자연어로 주제/난이도/내용 기반 추천을 원하면(예: "초보자를 위한 파이썬 책", "머신러닝 실무 도서") 반드시 semantic_search_books를 호출하세요.
 - 사용자가 가격에 대해 질문하면 반드시 get_books_by_price_range 또는 get_price_statistics를 호출하세요.
 - 사용자가 판매지수/인기/순위에 대해 질문하면 반드시 get_books_by_sales_index를 호출하세요.
 - 여러 조건이 복합적으로 주어지면 해당되는 모든 함수를 호출하세요.
@@ -602,6 +672,19 @@ with tab_chatbot:
                                 tool_summary_lines.append(
                                     f"  - #{b['rank']} {b['title']} | {b['author']} | {b['publisher']} | "
                                     f"{b['price']:,}원 | 평점:{r_str} | 리뷰:{b['reviews']}건 | {b['url']}"
+                                )
+                        else:
+                            tool_summary_lines.append(f"  {res['message']}")
+                    elif fn == "semantic_search_books":
+                        query = tr["args"].get("query", "")
+                        tool_summary_lines.append(f"[의미 검색: '{query}']")
+                        if res["books"]:
+                            for b in res["books"]:
+                                r_str = f"{b['rating']}" if b["rating"] else "N/A"
+                                tool_summary_lines.append(
+                                    f"  - #{b['rank']} {b['title']} | {b['author']} | {b['publisher']} | "
+                                    f"{b['price']:,}원 | 평점:{r_str} | 리뷰:{b['reviews']}건 | "
+                                    f"유사도:{b['similarity']} | {b['url']}"
                                 )
                         else:
                             tool_summary_lines.append(f"  {res['message']}")
