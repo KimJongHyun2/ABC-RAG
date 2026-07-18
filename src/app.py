@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from pathlib import Path
 from groq import Groq
 import chromadb
+import os
 import torch
 from transformers import AutoTokenizer, AutoModel
 
@@ -72,18 +73,65 @@ def search_books(query, top_n=20, db_path=None):
     return list(zip(docs, metas, distances))
 
 
+def obj_get(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def first_choice(response):
+    choices = obj_get(response, "choices", [])
+    return choices[0] if choices else None
+
+
+def choice_message(choice):
+    return obj_get(choice, "message", choice)
+
+
+def message_tool_calls(choice):
+    message = choice_message(choice)
+    return obj_get(message, "tool_calls", None) or obj_get(choice, "tool_calls", None)
+
+
+def message_content(choice):
+    message = choice_message(choice)
+    return obj_get(message, "content", "") or ""
+
+
+def parse_tool_call(tool_call):
+    function = obj_get(tool_call, "function", {})
+    return obj_get(function, "name", ""), obj_get(function, "arguments", "{}") or "{}"
+
+
+def get_secret(name):
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
+
+
 st.title("YES24 IT/모바일 베스트셀러 탐색적 데이터 분석")
 st.markdown("---")
 
 # ── 사이드바 ──
 st.sidebar.header("설정")
 
-groq_api_key = st.sidebar.text_input(
-    "Groq API Key",
-    type="password",
-    placeholder="gsk_...",
-    help="https://console.groq.com 에서 발급받은 API Key를 입력하세요.",
+configured_groq_api_key = (
+    get_secret("GROQ_API_KEY")
+    or get_secret("groq_api_key")
+    or os.getenv("GROQ_API_KEY")
+    or os.getenv("groq_api_key")
 )
+if configured_groq_api_key:
+    groq_api_key = configured_groq_api_key
+    st.sidebar.success("Groq API Key가 설정되어 있습니다.")
+else:
+    groq_api_key = st.sidebar.text_input(
+        "Groq API Key",
+        type="password",
+        placeholder="gsk_...",
+        help="https://console.groq.com 에서 발급받은 API Key를 입력하세요.",
+    )
 
 st.sidebar.header("필터")
 min_rank, max_rank = st.sidebar.slider(
@@ -300,35 +348,7 @@ with tab_search:
 with tab_chatbot:
     st.subheader("도서 추천 챗봇")
 
-    # ── 임베딩 파일 업로드 ──
-    st.markdown("#### 📁 임베딩 파일 업로드")
-    st.caption("배포 환경에서 챗봇을 사용하려면 ChromaDB ZIP 파일을 업로드하세요. (선택사항: 미업로드 시 기본 데이터 사용)")
-    uploaded_db = st.file_uploader(
-        "ChromaDB ZIP 파일 선택",
-        type=["zip"],
-        help="build_vectordb.py로 생성된 data/chromadb/ 폴더를 ZIP으로 압축하여 업로드하세요.",
-    )
-
-    if uploaded_db is not None:
-        import zipfile
-        import tempfile
-        import shutil
-
-        if "uploaded_db_path" not in st.session_state:
-            with tempfile.TemporaryDirectory() as tmpdir:
-                zip_path = Path(tmpdir) / "chromadb.zip"
-                with open(zip_path, "wb") as f:
-                    f.write(uploaded_db.getbuffer())
-                extract_dir = Path(tempfile.gettempdir()) / "abc_rag_uploaded_db"
-                if extract_dir.exists():
-                    shutil.rmtree(extract_dir)
-                extract_dir.mkdir(parents=True, exist_ok=True)
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    zf.extractall(extract_dir)
-                st.session_state.uploaded_db_path = str(extract_dir)
-            st.success("✅ 임베딩 파일이 업로드되었습니다!")
-
-    db_path = st.session_state.get("uploaded_db_path", None)
+    db_path = None
 
     if not groq_api_key:
         st.warning("좌측 사이드바에서 Groq API Key를 입력해주세요.")
@@ -596,7 +616,6 @@ with tab_chatbot:
         st.session_state.chat_messages.append({"role": "user", "content": user_input})
 
         messages_for_api = list(st.session_state.chat_messages)
-        messages_for_api.append({"role": "user", "content": user_input})
 
         try:
             groq_client = Groq(api_key=groq_api_key)
@@ -609,15 +628,20 @@ with tab_chatbot:
                     temperature=0.3,
                     max_tokens=2048,
                 )
-                msg = response.choices[0]
+                choice = first_choice(response)
+                if choice is None:
+                    raise ValueError("Groq API 응답에 choices가 없습니다.")
 
-            if msg.tool_calls:
+            tool_calls = message_tool_calls(choice)
+            if tool_calls:
                 assistant_text = ""
                 tool_results_context = []
-                for tc in msg.tool_calls:
-                    fn_name = tc.function.name
+                for tc in tool_calls:
                     import json
-                    fn_args = json.loads(tc.function.arguments)
+                    fn_name, raw_args = parse_tool_call(tc)
+                    if fn_name not in func_map:
+                        raise ValueError(f"지원하지 않는 도구 호출입니다: {fn_name}")
+                    fn_args = json.loads(raw_args)
                     result = func_map[fn_name](fn_args)
                     tool_results_context.append({"tool": fn_name, "args": fn_args, "result": result})
 
@@ -703,9 +727,12 @@ with tab_chatbot:
                         temperature=0.3,
                         max_tokens=2048,
                     )
-                    assistant_msg = follow_resp.choices[0].message.content
+                    follow_choice = first_choice(follow_resp)
+                    if follow_choice is None:
+                        raise ValueError("Groq API 후속 응답에 choices가 없습니다.")
+                    assistant_msg = message_content(follow_choice)
             else:
-                assistant_msg = msg.message.content
+                assistant_msg = message_content(choice)
 
         except Exception as e:
             assistant_msg = f"API 호출 중 오류가 발생했습니다: {e}"
