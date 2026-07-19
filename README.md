@@ -1,6 +1,6 @@
 # YES24 IT/모바일 베스트셀러 RAG 분석 시스템
 
-YES24 IT/모바일 종합 베스트셀러 데이터를 수집하고 분석하는 RAG(Retrieval-Augmented Generation) 기반 도서 추천 시스템입니다.
+YES24 IT/모바일 종합 베스트셀러 데이터를 수집하고 분석하는 RAG(Retrieval-Augmented Generation) 기반 도서 추천 시스템입니다!
 
 ## 주요 기능
 
